@@ -63,6 +63,9 @@ func TestUtxoValidationRuleFamilySamples(t *testing.T) {
 		common.UtxoValidationRuleWithdrawals:              "CERTS",
 		common.UtxoValidationRuleProtocolParameterUpdates: "PPUP",
 		common.UtxoValidationRuleRefScriptSizePerTx:       "LEDGER",
+		// Conway reports the treasury mismatch as ConwayTreasuryValueMismatch
+		// of the LEDGER rule (Rules/Ledger.hs), not of UTXO.
+		common.UtxoValidationRuleCurrentTreasuryValue: "LEDGER",
 	}
 	for id, family := range want {
 		got, ok := common.UtxoValidationRuleFamily(id)

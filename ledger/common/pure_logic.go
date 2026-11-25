@@ -100,7 +100,7 @@ var utxoValidationRuleFamilies = map[UtxoValidationRuleId]UtxoValidationFamily{
 	UtxoValidationRulePtrPresentInCollateralReturn: UtxoFamilyUtxo,
 	UtxoValidationRuleTooManyCollateralInputs:      UtxoFamilyUtxo,
 	UtxoValidationRuleMalformedReferenceScripts:    UtxoFamilyUtxow,
-	UtxoValidationRuleCurrentTreasuryValue:         UtxoFamilyUtxo,
+	UtxoValidationRuleCurrentTreasuryValue:         UtxoFamilyLedger,
 	UtxoValidationRuleProposalProcedures:           UtxoFamilyGov,
 	UtxoValidationRuleGovActionWellFormedness:      UtxoFamilyGov,
 	UtxoValidationRuleHardForkCanFollow:            UtxoFamilyGov,
