@@ -2140,26 +2140,15 @@ func UtxoValidateScriptDataHash(
 		}
 	}
 
-	// Encode language views per the Cardano spec
-	langViewsCbor, err := common.EncodeLangViews(
+	computedHash, err := common.ScriptDataHash(
+		redeemersCbor,
+		datumsCbor,
 		usedVersions,
 		tmpPparams.CostModels,
 	)
 	if err != nil {
 		return err
 	}
-
-	// Concatenate and hash
-	hashInput := make(
-		[]byte,
-		0,
-		len(redeemersCbor)+len(datumsCbor)+len(langViewsCbor),
-	)
-	hashInput = append(hashInput, redeemersCbor...)
-	hashInput = append(hashInput, datumsCbor...)
-	hashInput = append(hashInput, langViewsCbor...)
-
-	computedHash := common.Blake2b256Hash(hashInput)
 
 	// Compare with declared hash
 	// Note: declaredHash is guaranteed non-nil here due to earlier checks,
@@ -2591,176 +2580,22 @@ func UtxoValidateValueNotConservedUtxo(
 	if !ok {
 		return errors.New("pparams are not expected type")
 	}
-	// Calculate consumed value
-	// consumed = value from input(s) + withdrawals + refunds
-	consumedValue := new(big.Int)
-	for _, tmpInput := range tx.Inputs() {
-		tmpUtxo, err := ls.UtxoById(tmpInput)
-		// Ignore errors fetching the UTxO and exclude it from calculations
-		if err != nil {
-			continue
-		}
-		if amount := tmpUtxo.Output.Amount(); amount != nil {
-			consumedValue.Add(consumedValue, amount)
-		}
-	}
-	for _, tmpWithdrawalAmount := range tx.Withdrawals() {
-		if tmpWithdrawalAmount != nil {
-			consumedValue.Add(consumedValue, tmpWithdrawalAmount)
-		}
-	}
-	certificateRefunds, certificateDeposits, err := conwayValueConservationDeposits(
-		tx,
-		ls,
-		tmpPparams,
-	)
+	balance, err := computeValueBalance(tx, slot, ls, tmpPparams)
 	if err != nil {
 		return err
 	}
-	consumedValue.Add(consumedValue, certificateRefunds)
-	seenPoolRegistrations := make(map[common.PoolKeyHash]struct{})
-	// Add minted/burned ADA
-	if tx.AssetMint() != nil {
-		mintedAda := tx.AssetMint().Asset(common.Blake2b224{}, []byte{})
-		if mintedAda != nil {
-			consumedValue.Add(consumedValue, mintedAda)
-		}
-	}
-	// Calculate produced value
-	// produced = value from output(s) + fee + deposits
-	producedValue := new(big.Int)
-	for _, tmpOutput := range tx.Outputs() {
-		if amount := tmpOutput.Amount(); amount != nil {
-			producedValue.Add(producedValue, amount)
-		}
-	}
-	if fee := tx.Fee(); fee != nil {
-		producedValue.Add(producedValue, fee)
-	}
-	producedValue.Add(producedValue, certificateDeposits)
-	for _, cert := range tx.Certificates() {
-		switch tmpCert := cert.(type) {
-		case *common.PoolRegistrationCertificate:
-			operator := common.Blake2b224(tmpCert.Operator)
-			if _, seen := seenPoolRegistrations[operator]; seen {
-				continue
-			}
-			seenPoolRegistrations[operator] = struct{}{}
-			depositDue, err := common.PoolRegistrationDepositDue(
-				ls, slot, operator,
-			)
-			if err != nil {
-				return err
-			}
-			if depositDue {
-				producedValue.Add(producedValue, new(big.Int).SetUint64(uint64(tmpPparams.PoolDeposit)))
-			}
-		}
-	}
-	for range tx.ProposalProcedures() {
-		producedValue.Add(
-			producedValue,
-			new(big.Int).SetUint64(uint64(tmpPparams.GovActionDeposit)),
-		)
-	}
-	// Add treasury donation - value leaving the transaction to go to the treasury.
-	donation := tx.Donation()
-	if donation != nil && donation.Sign() > 0 {
-		if err := ValidateTreasuryDonationScriptCompatibility(tx, ls); err != nil {
-			return err
-		}
-		producedValue.Add(producedValue, donation)
-	}
-	if consumedValue.Cmp(producedValue) != 0 {
+	if balance.consumedCoin.Cmp(balance.producedCoin) != 0 {
 		return shelley.ValueNotConservedUtxoError{
-			Consumed: consumedValue,
-			Produced: producedValue,
+			Consumed: balance.consumedCoin,
+			Produced: balance.producedCoin,
 		}
 	}
 
-	// Multi-asset value conservation check
-	// For each policy and asset: consumed + minted == produced
-	type assetKey struct {
-		policy common.Blake2b224
-		asset  string
-	}
-
-	consumedAssets := make(map[assetKey]*big.Int)
-	producedAssets := make(map[assetKey]*big.Int)
-
-	// Collect consumed multi-assets from inputs
-	for _, tmpInput := range tx.Inputs() {
-		tmpUtxo, err := ls.UtxoById(tmpInput)
-		if err != nil {
-			continue
-		}
-		if assets := tmpUtxo.Output.Assets(); assets != nil {
-			assets.RangeUnordered(func(
-				policy common.Blake2b224,
-				assetName []byte,
-				amount common.MultiAssetTypeOutput,
-			) bool {
-				if amount == nil {
-					return true
-				}
-				key := assetKey{policy: policy, asset: string(assetName)}
-				if consumedAssets[key] == nil {
-					consumedAssets[key] = new(big.Int)
-				}
-				consumedAssets[key].Add(consumedAssets[key], amount)
-				return true
-			})
-		}
-	}
-
-	// Add minted/burned assets to consumed (positive for mint, negative for burn)
-	if mint := tx.AssetMint(); mint != nil {
-		mint.RangeUnordered(func(
-			policy common.Blake2b224,
-			assetName []byte,
-			amount common.MultiAssetTypeMint,
-		) bool {
-			if policy == (common.Blake2b224{}) && len(assetName) == 0 {
-				return true
-			}
-			if amount == nil {
-				return true
-			}
-			key := assetKey{policy: policy, asset: string(assetName)}
-			if consumedAssets[key] == nil {
-				consumedAssets[key] = new(big.Int)
-			}
-			consumedAssets[key].Add(consumedAssets[key], amount)
-			return true
-		})
-	}
-
-	// Collect produced multi-assets from outputs
-	for _, tmpOutput := range tx.Outputs() {
-		if assets := tmpOutput.Assets(); assets != nil {
-			assets.RangeUnordered(func(
-				policy common.Blake2b224,
-				assetName []byte,
-				amount common.MultiAssetTypeOutput,
-			) bool {
-				if amount == nil {
-					return true
-				}
-				key := assetKey{policy: policy, asset: string(assetName)}
-				if producedAssets[key] == nil {
-					producedAssets[key] = new(big.Int)
-				}
-				producedAssets[key].Add(producedAssets[key], amount)
-				return true
-			})
-		}
-	}
-
-	// Check that all consumed assets match produced assets without building
-	// an intermediate union set of keys.
+	// Multi-asset value conservation check: for each policy and asset,
+	// consumed (inputs plus minted) equals produced (outputs plus burned).
 	zero := new(big.Int)
-	for key, consumed := range consumedAssets {
-		produced := producedAssets[key]
+	for key, consumed := range balance.consumedAssets {
+		produced := balance.producedAssets[key]
 		if produced == nil {
 			produced = zero
 		}
@@ -2770,9 +2605,9 @@ func UtxoValidateValueNotConservedUtxo(
 				Produced: produced,
 			}
 		}
-		delete(producedAssets, key)
+		delete(balance.producedAssets, key)
 	}
-	for _, produced := range producedAssets {
+	for _, produced := range balance.producedAssets {
 		if produced.Cmp(zero) != 0 {
 			return shelley.ValueNotConservedUtxoError{
 				Consumed: zero,
