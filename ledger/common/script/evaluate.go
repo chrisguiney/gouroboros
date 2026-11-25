@@ -15,6 +15,7 @@
 package script
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -34,6 +35,26 @@ func EvaluatePlutusScripts(
 	maxPlutusVersion uint,
 	era string,
 	budget *common.ExUnits,
+) (map[common.RedeemerKey]common.ExUnits, error) {
+	return evaluatePlutusScripts(
+		tx, ls, protocolMajor, costModels, maxPlutusVersion, era, budget,
+		false,
+	)
+}
+
+// evaluatePlutusScripts is the shared body of EvaluatePlutusScripts and
+// EvaluatePlutusScriptsPure. pure selects whether each script runs through
+// the process-wide machine pool and program cache or through
+// common.EvaluatePlutusScriptPure; everything before the script run is shared.
+func evaluatePlutusScripts(
+	tx common.Transaction,
+	ls common.LedgerState,
+	protocolMajor uint,
+	costModels map[uint][]int64,
+	maxPlutusVersion uint,
+	era string,
+	budget *common.ExUnits,
+	pure bool,
 ) (map[common.RedeemerKey]common.ExUnits, error) {
 	if tx == nil {
 		return nil, errors.New("nil transaction")
@@ -229,15 +250,10 @@ func EvaluatePlutusScripts(
 			}
 			ctx := NewScriptContextV3(txInfoV3Cached, redeemer, purpose)
 			ctxData := ctx.ToPlutusData()
-			evalContext, err := common.PooledEvalContext(
-				lang.LanguageVersionV3,
-				protocolMajor,
-				costModels[2],
+			usedUnits, execErr = runPlutusScript(
+				pure, lang.LanguageVersionV3, protocolMajor, costModels[2],
+				s, nil, nil, ctxData, units,
 			)
-			if err != nil {
-				return nil, fmt.Errorf("build evaluation context: %w", err)
-			}
-			usedUnits, execErr = s.Evaluate(ctxData, units, evalContext)
 		case common.PlutusV2Script:
 			if maxPlutusVersion < 2 {
 				return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
@@ -266,15 +282,10 @@ func EvaluatePlutusScripts(
 			// Build V1V2 context
 			ctx := NewScriptContextV1V2(txInfoV2Cached, purpose)
 			ctxData := ctx.ToPlutusData()
-			evalContext, err := common.PooledEvalContext(
-				lang.LanguageVersionV2,
-				protocolMajor,
-				costModels[1],
+			usedUnits, execErr = runPlutusScript(
+				pure, lang.LanguageVersionV2, protocolMajor, costModels[1],
+				s, datum, redeemerValue.Data.Data, ctxData, units,
 			)
-			if err != nil {
-				return nil, fmt.Errorf("build evaluation context: %w", err)
-			}
-			usedUnits, execErr = s.Evaluate(datum, data.NormalizeShared(redeemerValue.Data.Data), ctxData, units, evalContext)
 		case common.PlutusV1Script:
 			if maxPlutusVersion < 1 {
 				return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
@@ -303,15 +314,10 @@ func EvaluatePlutusScripts(
 			// Build V1V2 context
 			ctx := NewScriptContextV1V2(txInfoV1Cached, purpose)
 			ctxData := ctx.ToPlutusData()
-			evalContext, err := common.PooledEvalContext(
-				lang.LanguageVersionV1,
-				protocolMajor,
-				costModels[0],
+			usedUnits, execErr = runPlutusScript(
+				pure, lang.LanguageVersionV1, protocolMajor, costModels[0],
+				s, datum, redeemerValue.Data.Data, ctxData, units,
 			)
-			if err != nil {
-				return nil, fmt.Errorf("build evaluation context: %w", err)
-			}
-			usedUnits, execErr = s.Evaluate(datum, data.NormalizeShared(redeemerValue.Data.Data), ctxData, units, evalContext)
 		default:
 			continue
 		}
@@ -328,4 +334,67 @@ func EvaluatePlutusScripts(
 	}
 
 	return used, nil
+}
+
+// runPlutusScript evaluates one script. When pure is false it uses a pooled
+// evaluation context and the script's pooled Evaluate method; otherwise it
+// builds everything fresh. The script's own Evaluate methods and
+// common.EvaluatePlutusScriptPure share one evaluation routine, so the two
+// differ only in caching.
+func runPlutusScript(
+	pure bool,
+	language lang.LanguageVersion,
+	protocolMajor uint,
+	costModelParams []int64,
+	script common.Script,
+	datum data.PlutusData,
+	redeemer data.PlutusData,
+	scriptContext data.PlutusData,
+	units common.ExUnits,
+) (common.ExUnits, error) {
+	if pure {
+		return common.EvaluatePlutusScriptPure(
+			context.Background(),
+			common.PlutusScriptEvalInput{
+				Language:      language,
+				Script:        script.RawScriptBytes(),
+				Datum:         datum,
+				Redeemer:      redeemer,
+				ScriptContext: scriptContext,
+				Budget:        units,
+			},
+			protocolMajor,
+			costModelParams,
+		)
+	}
+	evalContext, err := common.PooledEvalContext(
+		language,
+		protocolMajor,
+		costModelParams,
+	)
+	if err != nil {
+		return common.ExUnits{}, fmt.Errorf(
+			"build evaluation context: %w",
+			err,
+		)
+	}
+	switch s := script.(type) {
+	case common.PlutusV1Script:
+		return s.Evaluate(
+			datum, data.NormalizeShared(redeemer), scriptContext, units,
+			evalContext,
+		)
+	case common.PlutusV2Script:
+		return s.Evaluate(
+			datum, data.NormalizeShared(redeemer), scriptContext, units,
+			evalContext,
+		)
+	case common.PlutusV3Script:
+		return s.Evaluate(scriptContext, units, evalContext)
+	default:
+		return common.ExUnits{}, fmt.Errorf(
+			"unsupported script type %T",
+			script,
+		)
+	}
 }

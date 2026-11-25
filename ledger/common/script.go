@@ -285,60 +285,17 @@ func (s PlutusV1Script) EvaluateContext(
 	budget ExUnits,
 	evalContext *cek.EvalContext,
 ) (ExUnits, error) {
-	if err := ctx.Err(); err != nil {
-		return ExUnits{}, err
-	}
-	// Normalize the script-visible arguments rather than trusting every
-	// caller to do it. Decode preserves each container's definite/indefinite
-	// length choice so a decoded value re-encodes to its original bytes, but
-	// cardano-ledger rebuilds these values instead, which is equivalent to the
-	// package default encoding. A datum or redeemer applied straight from the
-	// wire can therefore serialise to different bytes than the reference
-	// implementation's for the same semantic value, and a script that hashes or
-	// compares SerialiseData output diverges from the rest of the network.
-	// V3 takes no datum or redeemer argument -- its redeemer travels inside the
-	// script context, which NewScriptContextV3 normalizes.
-	datum = data.NormalizeShared(datum)
-	redeemer = data.NormalizeShared(redeemer)
-	var usedExUnits ExUnits
-	var err error
-	var program *cek.PreparedProgram
-	machineBudget := exBudgetFromUnits(budget)
-	// Decode raw script as bytestring to get actual script bytes
-	innerScript, err := decodePlutusScript([]byte(s), false)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode cbor: %w", err)
-	}
-	// Decode program
-	program, err = decodePreparedPlutusProgram(
-		innerScript,
-		lang.LanguageVersionV1,
-		evalContext,
-	)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode script: %w", err)
-	}
-	// Apply ledger data as trusted arguments so it does not count against the
-	// structural limit on the UPLC program itself.
-	trustedArguments := make([]data.PlutusData, 0, 3)
-	if datum != nil {
-		trustedArguments = append(trustedArguments, datum)
-	}
-	trustedArguments = append(trustedArguments, redeemer, scriptContext)
-	consumedBudget, _, runErr := runPooledPreparedContext(
+	return evaluatePlutusScript(
 		ctx,
-		cek.LanguageVersionV1,
+		pooledPlutusRuntime,
+		lang.LanguageVersionV1,
+		[]byte(s),
+		datum,
+		redeemer,
+		scriptContext,
+		budget,
 		evalContext,
-		machineBudget,
-		program,
-		trustedArguments...,
 	)
-	usedExUnits.Memory = consumedBudget.Mem
-	usedExUnits.Steps = consumedBudget.Cpu
-	if runErr != nil {
-		return usedExUnits, fmt.Errorf("execute script: %w", runErr)
-	}
-	return usedExUnits, nil
 }
 
 type PlutusV2Script []byte
@@ -384,60 +341,17 @@ func (s PlutusV2Script) EvaluateContext(
 	budget ExUnits,
 	evalContext *cek.EvalContext,
 ) (ExUnits, error) {
-	if err := ctx.Err(); err != nil {
-		return ExUnits{}, err
-	}
-	// Normalize the script-visible arguments rather than trusting every
-	// caller to do it. Decode preserves each container's definite/indefinite
-	// length choice so a decoded value re-encodes to its original bytes, but
-	// cardano-ledger rebuilds these values instead, which is equivalent to the
-	// package default encoding. A datum or redeemer applied straight from the
-	// wire can therefore serialise to different bytes than the reference
-	// implementation's for the same semantic value, and a script that hashes or
-	// compares SerialiseData output diverges from the rest of the network.
-	// V3 takes no datum or redeemer argument -- its redeemer travels inside the
-	// script context, which NewScriptContextV3 normalizes.
-	datum = data.NormalizeShared(datum)
-	redeemer = data.NormalizeShared(redeemer)
-	var usedExUnits ExUnits
-	var err error
-	var program *cek.PreparedProgram
-	machineBudget := exBudgetFromUnits(budget)
-	// Decode raw script as bytestring to get actual script bytes
-	innerScript, err := decodePlutusScript([]byte(s), false)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode cbor: %w", err)
-	}
-	// Decode program
-	program, err = decodePreparedPlutusProgram(
-		innerScript,
-		lang.LanguageVersionV2,
-		evalContext,
-	)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode script: %w", err)
-	}
-	// Apply ledger data as trusted arguments so it does not count against the
-	// structural limit on the UPLC program itself.
-	trustedArguments := make([]data.PlutusData, 0, 3)
-	if datum != nil {
-		trustedArguments = append(trustedArguments, datum)
-	}
-	trustedArguments = append(trustedArguments, redeemer, scriptContext)
-	consumedBudget, _, runErr := runPooledPreparedContext(
+	return evaluatePlutusScript(
 		ctx,
-		cek.LanguageVersionV2,
+		pooledPlutusRuntime,
+		lang.LanguageVersionV2,
+		[]byte(s),
+		datum,
+		redeemer,
+		scriptContext,
+		budget,
 		evalContext,
-		machineBudget,
-		program,
-		trustedArguments...,
 	)
-	usedExUnits.Memory = consumedBudget.Mem
-	usedExUnits.Steps = consumedBudget.Cpu
-	if runErr != nil {
-		return usedExUnits, fmt.Errorf("execute script: %w", runErr)
-	}
-	return usedExUnits, nil
 }
 
 type PlutusV3Script []byte
@@ -476,46 +390,17 @@ func (s PlutusV3Script) EvaluateContext(
 	budget ExUnits,
 	evalContext *cek.EvalContext,
 ) (ExUnits, error) {
-	if err := ctx.Err(); err != nil {
-		return ExUnits{}, err
-	}
-	var usedExUnits ExUnits
-	var err error
-	var program *cek.PreparedProgram
-	machineBudget := exBudgetFromUnits(budget)
-	// Decode raw script as bytestring to get actual script bytes
-	innerScript, err := decodePlutusScript([]byte(s), true)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode cbor: %w", err)
-	}
-	// Decode program
-	program, err = decodePreparedPlutusProgram(
-		innerScript,
-		lang.LanguageVersionV3,
-		evalContext,
-	)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode script: %w", err)
-	}
-	// Execute the program with its ledger context as a trusted argument so it
-	// does not count against the structural limit on the UPLC program itself.
-	consumedBudget, isUnit, runErr := runPooledPreparedContext(
+	return evaluatePlutusScript(
 		ctx,
-		cek.LanguageVersionV3,
-		evalContext,
-		machineBudget,
-		program,
+		pooledPlutusRuntime,
+		lang.LanguageVersionV3,
+		[]byte(s),
+		nil,
+		nil,
 		scriptContext,
+		budget,
+		evalContext,
 	)
-	if runErr == nil && !isUnit {
-		runErr = PlutusScriptResultNotUnitError{}
-	}
-	usedExUnits.Memory = consumedBudget.Mem
-	usedExUnits.Steps = consumedBudget.Cpu
-	if runErr != nil {
-		return usedExUnits, fmt.Errorf("execute script: %w", runErr)
-	}
-	return usedExUnits, nil
 }
 
 type PlutusV4Script []byte
@@ -554,42 +439,17 @@ func (s PlutusV4Script) EvaluateContext(
 	budget ExUnits,
 	evalContext *cek.EvalContext,
 ) (ExUnits, error) {
-	if err := ctx.Err(); err != nil {
-		return ExUnits{}, err
-	}
-	var usedExUnits ExUnits
-	var err error
-	var program *cek.PreparedProgram
-	machineBudget := exBudgetFromUnits(budget)
-	innerScript, err := decodePlutusScript([]byte(s), true)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode cbor: %w", err)
-	}
-	program, err = decodePreparedPlutusProgram(
-		innerScript,
-		lang.LanguageVersionV4,
-		evalContext,
-	)
-	if err != nil {
-		return usedExUnits, fmt.Errorf("decode script: %w", err)
-	}
-	consumedBudget, isUnit, runErr := runPooledPreparedContext(
+	return evaluatePlutusScript(
 		ctx,
-		cek.LanguageVersionV4,
-		evalContext,
-		machineBudget,
-		program,
+		pooledPlutusRuntime,
+		lang.LanguageVersionV4,
+		[]byte(s),
+		nil,
+		nil,
 		scriptContext,
+		budget,
+		evalContext,
 	)
-	if runErr == nil && !isUnit {
-		runErr = PlutusScriptResultNotUnitError{}
-	}
-	usedExUnits.Memory = consumedBudget.Mem
-	usedExUnits.Steps = consumedBudget.Cpu
-	if runErr != nil {
-		return usedExUnits, fmt.Errorf("execute script: %w", runErr)
-	}
-	return usedExUnits, nil
 }
 
 func PlutusScriptVersion(script Script) (uint, bool) {

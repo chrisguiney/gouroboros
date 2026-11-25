@@ -565,22 +565,24 @@ func VerifyTransactionWithSignatures(
 	validationRules []UtxoValidationRuleFunc,
 	signatures *PreverifiedSignatures,
 ) error {
-	ledgerState = newTransactionScopedLedgerState(ledgerState, signatures)
-	for i, rule := range validationRules {
-		if err := rule(tx, slot, ledgerState, protocolParams); err != nil {
+	var result error
+	runUtxoValidationRules(
+		tx, slot, ledgerState, protocolParams, validationRules, signatures,
+		func(i int, err error) bool {
 			details := map[string]any{"rule_index": i, "slot": slot}
 			if tx != nil {
 				details["tx_hash"] = tx.Hash().String()
 			}
-			return NewValidationError(
+			result = NewValidationError(
 				ValidationErrorTypeTransaction,
 				"transaction validation failed",
 				details,
 				err,
 			)
-		}
-	}
-	return nil
+			return false
+		},
+	)
+	return result
 }
 
 const (

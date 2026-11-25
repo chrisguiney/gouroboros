@@ -2408,23 +2408,21 @@ func (p *Protocol) stateLoop(ch <-chan protocolStateTransition) {
 }
 
 func (p *Protocol) nextState(currentState State, msg Message) (State, error) {
-	for _, transition := range p.config.StateMap[currentState].Transitions {
-		if transition.MsgType == msg.Type() {
-			if transition.MatchFunc != nil {
-				// Skip item if match function returns false
-				if !transition.MatchFunc(p.config.StateContext, msg) {
-					continue
-				}
-			}
-			return transition.NewState, nil
-		}
-	}
-
-	return State{}, fmt.Errorf(
-		"message %T not allowed in current protocol state %s",
-		msg,
+	next, _, err := NextState(
+		p.config.StateMap,
+		p.config.StateContext,
 		currentState,
+		msg.Type(),
+		msg,
 	)
+	if err != nil {
+		return State{}, fmt.Errorf(
+			"message %T not allowed in current protocol state %s",
+			msg,
+			currentState,
+		)
+	}
+	return next, nil
 }
 
 func (p *Protocol) peerHasAgency() bool {

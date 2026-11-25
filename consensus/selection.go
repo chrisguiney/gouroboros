@@ -17,7 +17,6 @@ package consensus
 import (
 	"log/slog"
 	"math"
-	"math/big"
 	"sync"
 
 	"github.com/blinklabs-io/gouroboros/ledger/common"
@@ -182,53 +181,7 @@ func (p *PraosChainSelector) Compare(a, b ChainTip) int {
 		return 1
 	}
 
-	// Rule 1: Prefer longer chain (higher block number)
-	if a.BlockNumber() != b.BlockNumber() {
-		if a.BlockNumber() > b.BlockNumber() {
-			return 1
-		}
-		return -1
-	}
-
-	// A replacement hot key must win over a compromised key from the same
-	// issuer in the same slot. Other issuers' counters are unrelated.
-	if a.Slot() == b.Slot() && a.IssuerVkey() == b.IssuerVkey() {
-		aIssue, bIssue := a.OpCertSequenceNumber(), b.OpCertSequenceNumber()
-		if aIssue > bIssue {
-			return 1
-		}
-		if aIssue < bIssue {
-			return -1
-		}
-	}
-
-	aVRFBytes := a.VRFOutput()
-	bVRFBytes := b.VRFOutput()
-
-	// Handle empty VRF outputs - missing VRF is less preferred
-	if len(aVRFBytes) == 0 && len(bVRFBytes) == 0 {
-		return 0 // Both missing VRF, consider equal
-	}
-	if len(aVRFBytes) == 0 {
-		return -1 // a missing VRF is less preferred
-	}
-	if len(bVRFBytes) == 0 {
-		return 1 // b missing VRF is less preferred
-	}
-
-	aVRF := new(big.Int).SetBytes(aVRFBytes)
-	bVRF := new(big.Int).SetBytes(bVRFBytes)
-
-	// Lower VRF output is preferred, so we negate the comparison
-	cmp := aVRF.Cmp(bVRF)
-	if cmp < 0 {
-		return 1 // a has lower VRF, preferred
-	}
-	if cmp > 0 {
-		return -1 // b has lower VRF, preferred
-	}
-
-	return 0
+	return ComparePraosTips(praosTipView(a), praosTipView(b))
 }
 
 // IsDeepFork reports whether adopting a candidate that branches at fork

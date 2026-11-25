@@ -14,26 +14,20 @@
 
 package consensus
 
-import "github.com/blinklabs-io/gouroboros/ledger/common"
-
 const conwayVRFTiebreakerMaxDistance uint64 = 5
 
 // PreferCandidate reports whether candidate should replace current. A tie
 // keeps the current chain. A nil current tip permits initial selection.
 // ProtocolMajor selects the era's VRF switching rule.
 func (p *PraosChainSelector) PreferCandidate(current, candidate ChainTip) bool {
-	if current != nil && candidate != nil &&
-		p.ProtocolMajor >= common.ProtocolVersionConway &&
-		current.BlockNumber() == candidate.BlockNumber() {
-		earlier, later := current.Slot(), candidate.Slot()
-		if earlier > later {
-			earlier, later = later, earlier
-		}
-		if later-earlier > conwayVRFTiebreakerMaxDistance {
-			return false
-		}
+	if current == nil || candidate == nil {
+		return p.Compare(candidate, current) > 0
 	}
-	return p.Compare(candidate, current) > 0
+	return PreferPraosCandidate(
+		praosTipView(current),
+		praosTipView(candidate),
+		p.ProtocolMajor,
+	)
 }
 
 // PreferCandidateWithDensity applies the switching rule after the same
