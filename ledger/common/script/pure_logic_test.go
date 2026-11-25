@@ -73,3 +73,25 @@ func TestSlotToTimeFuncPropagatesConversionError(t *testing.T) {
 	)
 	require.ErrorIs(t, err, boom)
 }
+
+func TestTxInfoDataFillsTheScriptContext(t *testing.T) {
+	t.Parallel()
+	info := script.TxInfoData{Data: data.NewConstr(0, data.NewInteger(big.NewInt(7)))}
+	purpose := script.ScriptPurposeMinting{PolicyId: common.NewBlake2b224(make([]byte, 28))}
+	redeemer := script.Redeemer{
+		Tag:  common.RedeemerTagMint,
+		Data: data.NewInteger(big.NewInt(9)),
+	}
+	t.Run("v1v2", func(t *testing.T) {
+		t.Parallel()
+		got := script.NewScriptContextV1V2(info, purpose).ToPlutusData()
+		want := data.NewConstr(0, info.Data, script.WithWrappedTransactionId{Value: purpose}.ToPlutusData())
+		require.Equal(t, want, got)
+	})
+	t.Run("v3", func(t *testing.T) {
+		t.Parallel()
+		got := script.NewScriptContextV3(info, redeemer, purpose).ToPlutusData()
+		want := data.NewConstr(0, info.Data, redeemer.Data, purpose.ToScriptInfo().ToPlutusData())
+		require.Equal(t, want, got)
+	})
+}

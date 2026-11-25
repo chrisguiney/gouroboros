@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/blinklabs-io/gouroboros/ledger/common"
+	"github.com/blinklabs-io/plutigo/data"
 )
 
 // EvaluatePlutusScriptsPure behaves as EvaluatePlutusScripts but evaluates
@@ -53,3 +54,14 @@ func (f SlotToTimeFunc) SlotToTime(slot uint64) (time.Time, error) {
 func (SlotToTimeFunc) TimeToSlot(time.Time) (uint64, error) {
 	return 0, errors.New("time to slot conversion is not available")
 }
+
+// TxInfoData is a TxInfo held as PlutusData, for callers that have the
+// TxInfo as serialised data rather than building it from a transaction.
+type TxInfoData struct {
+	Data data.PlutusData
+}
+
+func (TxInfoData) isTxInfo() {}
+
+// ToPlutusData returns the held data.
+func (t TxInfoData) ToPlutusData() data.PlutusData { return t.Data }
