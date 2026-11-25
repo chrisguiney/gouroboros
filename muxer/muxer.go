@@ -1444,17 +1444,16 @@ func (m *Muxer) readLoop() {
 			))
 			return
 		}
-		header := SegmentHeader{}
-		if err := binary.Read(m.conn, binary.BigEndian, &header); err != nil {
+		var headerBytes [SegmentHeaderLength]byte
+		if _, err := io.ReadFull(m.conn, headerBytes[:]); err != nil {
 			m.sendError(readLoopError("reading header", err))
 			return
 		}
-		// Check for zero-byte payload
-		// This prevents certain types of DoS attacks
-		if header.PayloadLength == 0 {
-			m.sendError(
-				errors.New("received zero-byte segment payload"),
-			)
+		// A zero-byte payload is rejected to prevent certain types of DoS
+		// attacks
+		header, err := DecodeSegmentHeader(headerBytes[:])
+		if err != nil {
+			m.sendError(err)
 			return
 		}
 		msg := &Segment{

@@ -385,25 +385,53 @@ type PBFTState struct {
 type pbftLog struct {
 	mu      sync.Mutex
 	entries []common.Blake2b224
+	// slots runs alongside entries: the slot each entry was signed in, when
+	// it is known.
+	slots []pbftSlot
 	// counts holds the occurrences of each issuer in the window of the state
 	// that ends at len(entries). It is nil until a Transition needs it and is
 	// kept current by every later in-place append.
 	counts map[common.Blake2b224]uint64
 }
 
+// pbftSlot is the slot of one window entry. Entries added without a slot
+// (Observe, Transition, and the constructors that take issuers only) have none
+// known.
+type pbftSlot struct {
+	slot  uint64
+	known bool
+}
+
+// PBFTSigner is one entry of the signature window: the genesis issuer charged
+// and, when known, the slot of the block it signed. The reference's PBftSigner
+// always has a slot; SlotKnown is false only for entries added through the
+// issuer-only API.
+type PBFTSigner struct {
+	Issuer    common.Blake2b224
+	Slot      uint64
+	SlotKnown bool
+}
+
+// ErrPBFTInvalidSlot is returned by TransitionAt for a slot before the last
+// signer's, the reference's PBftInvalidSlot.
+var ErrPBFTInvalidSlot = errors.New(
+	"byron PBFT block slot precedes the last signed slot",
+)
+
 // newPBFTLog copies window into a log with room to grow by a full security
-// window before it has to be copied again.
+// window before it has to be copied again. slots is either nil (no slot is
+// known) or as long as window.
 func newPBFTLog(
 	window []common.Blake2b224,
+	slots []pbftSlot,
 	securityParam uint64,
 ) *pbftLog {
-	entries := make(
-		[]common.Blake2b224,
-		len(window),
-		max(uint64(len(window)), 2*securityParam),
-	)
+	size := max(uint64(len(window)), 2*securityParam)
+	entries := make([]common.Blake2b224, len(window), size)
 	copy(entries, window)
-	return &pbftLog{entries: entries}
+	slotLog := make([]pbftSlot, len(window), size)
+	copy(slotLog, slots)
+	return &pbftLog{entries: entries, slots: slotLog}
 }
 
 // window returns the state's entries. The caller holds s.log.mu when the
@@ -414,6 +442,15 @@ func (s PBFTState) window() []common.Blake2b224 {
 		return []common.Blake2b224{}
 	}
 	return s.log.entries[s.start:s.end]
+}
+
+// slotWindow returns the slots of the state's entries, under the same lock
+// rule as window.
+func (s PBFTState) slotWindow() []pbftSlot {
+	if s.log == nil {
+		return []pbftSlot{}
+	}
+	return s.log.slots[s.start:s.end]
 }
 
 // size is the number of entries in the window. It reads only the state's own
@@ -487,12 +524,60 @@ func NewPBFTStateWithThreshold(
 		)
 	}
 	return PBFTState{
-		log:                  newPBFTLog(signatureHistory, securityParam),
+		log:                  newPBFTLog(signatureHistory, nil, securityParam),
 		end:                  len(signatureHistory),
 		securityParam:        securityParam,
 		thresholdNumerator:   numerator,
 		thresholdDenominator: denominator,
 	}, nil
+}
+
+// NewPBFTStateWithSlots constructs state from an ordered oldest-to-newest
+// history in which every signer carries the slot it signed, as the
+// reference's PBftState does. Slots must not decrease along the history.
+func NewPBFTStateWithSlots(
+	signers []PBFTSigner,
+	securityParam uint64,
+	numerator uint64,
+	denominator uint64,
+) (PBFTState, error) {
+	history := make([]common.Blake2b224, len(signers))
+	slots := make([]pbftSlot, len(signers))
+	for i, signer := range signers {
+		history[i] = signer.Issuer
+		slots[i] = pbftSlot{slot: signer.Slot, known: signer.SlotKnown}
+		if i > 0 && signer.SlotKnown && signers[i-1].SlotKnown &&
+			signer.Slot < signers[i-1].Slot {
+			return PBFTState{}, fmt.Errorf(
+				"byron PBFT signer %d is in slot %d, before slot %d of the signer before it",
+				i, signer.Slot, signers[i-1].Slot,
+			)
+		}
+	}
+	state, err := NewPBFTStateWithThreshold(history, securityParam, numerator, denominator)
+	if err != nil {
+		return PBFTState{}, err
+	}
+	copy(state.log.slots, slots)
+	return state, nil
+}
+
+// Signers returns an independent oldest-to-newest copy of the window with the
+// slots that are known.
+func (s PBFTState) Signers() []PBFTSigner {
+	if s.log == nil {
+		return nil
+	}
+	s.log.mu.Lock()
+	defer s.log.mu.Unlock()
+	issuers, slots := s.window(), s.slotWindow()
+	out := make([]PBFTSigner, len(issuers))
+	for i := range issuers {
+		out[i] = PBFTSigner{
+			Issuer: issuers[i], Slot: slots[i].slot, SlotKnown: slots[i].known,
+		}
+	}
+	return out
 }
 
 // SignatureHistory returns an independent oldest-to-newest copy of the
@@ -512,15 +597,30 @@ func (s PBFTState) SignatureHistory() []common.Blake2b224 {
 func (s PBFTState) Observe(
 	issuer common.Blake2b224,
 ) (PBFTState, error) {
+	return s.observe(issuer, pbftSlot{})
+}
+
+// ObserveAt is Observe for a block signed in slot.
+func (s PBFTState) ObserveAt(
+	issuer common.Blake2b224,
+	slot uint64,
+) (PBFTState, error) {
+	return s.observe(issuer, pbftSlot{slot: slot, known: true})
+}
+
+func (s PBFTState) observe(
+	issuer common.Blake2b224,
+	slot pbftSlot,
+) (PBFTState, error) {
 	if err := s.validate(); err != nil {
 		return PBFTState{}, err
 	}
 	if s.log == nil {
-		return s.advance(s.window(), issuer), nil
+		return s.advance(s.window(), s.slotWindow(), issuer, slot), nil
 	}
 	s.log.mu.Lock()
 	defer s.log.mu.Unlock()
-	return s.advanceLocked(issuer), nil
+	return s.advanceLocked(issuer, slot), nil
 }
 
 // Transition applies the Byron SIGCNT rule using this state's configured
@@ -528,6 +628,42 @@ func (s PBFTState) Observe(
 // that issuer appears more than floor(threshold*k) times in the window.
 func (s PBFTState) Transition(
 	issuer common.Blake2b224,
+) (PBFTState, error) {
+	return s.transition(issuer, pbftSlot{})
+}
+
+// TransitionAt is Transition for a block signed in slot, and first applies the
+// reference's slot rule: the slot must not precede the last signer's, when that
+// is known. The reference compares non-strictly because a boundary block shares
+// the first slot of its epoch.
+func (s PBFTState) TransitionAt(
+	issuer common.Blake2b224,
+	slot uint64,
+) (PBFTState, error) {
+	if err := s.validate(); err != nil {
+		return PBFTState{}, err
+	}
+	if s.log != nil {
+		s.log.mu.Lock()
+		slots := s.slotWindow()
+		var last pbftSlot
+		if len(slots) > 0 {
+			last = slots[len(slots)-1]
+		}
+		s.log.mu.Unlock()
+		if last.known && slot < last.slot {
+			return PBFTState{}, fmt.Errorf(
+				"%w: slot %d, last signed slot %d",
+				ErrPBFTInvalidSlot, slot, last.slot,
+			)
+		}
+	}
+	return s.transition(issuer, pbftSlot{slot: slot, known: true})
+}
+
+func (s PBFTState) transition(
+	issuer common.Blake2b224,
+	slot pbftSlot,
 ) (PBFTState, error) {
 	if err := s.validate(); err != nil {
 		return PBFTState{}, err
@@ -555,9 +691,9 @@ func (s PBFTState) Transition(
 		)
 	}
 	if s.log == nil {
-		return s.advance(s.window(), issuer), nil
+		return s.advance(s.window(), s.slotWindow(), issuer, slot), nil
 	}
-	return s.advanceLocked(issuer), nil
+	return s.advanceLocked(issuer, slot), nil
 }
 
 func (s PBFTState) validate() error {
@@ -629,10 +765,13 @@ func (l *pbftLog) countsLocked(
 
 // advanceLocked returns the state that results from appending issuer. The
 // caller holds s.log.mu.
-func (s PBFTState) advanceLocked(issuer common.Blake2b224) PBFTState {
+func (s PBFTState) advanceLocked(
+	issuer common.Blake2b224,
+	slot pbftSlot,
+) PBFTState {
 	window := s.window()
 	if !s.extendsLog() || len(s.log.entries) == cap(s.log.entries) {
-		return s.advance(window, issuer)
+		return s.advance(window, s.slotWindow(), issuer, slot)
 	}
 	next := s
 	next.end++
@@ -649,6 +788,7 @@ func (s PBFTState) advanceLocked(issuer common.Blake2b224) PBFTState {
 		counts[issuer]++
 	}
 	s.log.entries = append(s.log.entries, issuer)
+	s.log.slots = append(s.log.slots, slot)
 	return next
 }
 
@@ -656,13 +796,17 @@ func (s PBFTState) advanceLocked(issuer common.Blake2b224) PBFTState {
 // window, in a log of its own.
 func (s PBFTState) advance(
 	window []common.Blake2b224,
+	slots []pbftSlot,
 	issuer common.Blake2b224,
+	slot pbftSlot,
 ) PBFTState {
 	if s.full() {
 		window = window[1:]
+		slots = slots[1:]
 	}
-	log := newPBFTLog(window, s.securityParam)
+	log := newPBFTLog(window, slots, s.securityParam)
 	log.entries = append(log.entries, issuer)
+	log.slots = append(log.slots, slot)
 	s.log = log
 	s.start = 0
 	s.end = len(log.entries)

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/blinklabs-io/gouroboros/ledger/common"
 	"github.com/blinklabs-io/plutigo/data"
@@ -56,17 +57,85 @@ func evaluatePlutusScripts(
 	budget *common.ExUnits,
 	pure bool,
 ) (map[common.RedeemerKey]common.ExUnits, error) {
+	used := make(map[common.RedeemerKey]common.ExUnits)
+	collector, err := newPlutusCollector(
+		tx, ls, protocolMajor, maxPlutusVersion, era,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if collector == nil {
+		return used, nil
+	}
+	// Each redeemer is collected and then run before the next is collected,
+	// so the first failure, whether in collection or execution, is the one
+	// reported.
+	for redeemerKey, redeemerValue := range collector.redeemers.Iter() {
+		collected, err := collector.collect(redeemerKey, redeemerValue)
+		if err != nil {
+			return nil, err
+		}
+		if collected == nil {
+			continue
+		}
+		usedUnits, err := collected.execute(
+			pure, protocolMajor, costModels, budget,
+		)
+		if err != nil {
+			return nil, err
+		}
+		used[redeemerKey] = usedUnits
+	}
+	return used, nil
+}
+
+// plutusCollector holds what collecting a script needs of one transaction:
+// the resolved inputs, the scripts available to it and the TxInfo of each
+// language, built the first time a script of that language is collected.
+type plutusCollector struct {
+	tx               common.Transaction
+	ls               common.LedgerState
+	protocolMajor    uint
+	maxPlutusVersion uint
+	era              string
+	redeemers        common.TransactionWitnessRedeemers
+
+	resolvedInputs     []common.Utxo
+	resolvedInputsMap  map[string]common.Utxo
+	availableScripts   map[common.ScriptHash]common.Script
+	sortedInputs       []common.TransactionInput
+	assetMint          common.MultiAsset[common.MultiAssetTypeMint]
+	withdrawals        map[*common.Address]*big.Int
+	votes              common.VotingProcedures
+	proposalProcedures []common.ProposalProcedure
+	certificates       []common.Certificate
+	witnessDatums      map[common.Blake2b256]*common.Datum
+
+	// The TxInfo is cached so each redeemer reuses one PlutusData
+	// conversion of it.
+	txInfoV1, txInfoV2, txInfoV3 *CachedTxInfo
+}
+
+// newPlutusCollector prepares to collect the scripts of tx's redeemers. It
+// returns a nil collector when there is nothing to collect: no witnesses or
+// no redeemers.
+func newPlutusCollector(
+	tx common.Transaction,
+	ls common.LedgerState,
+	protocolMajor uint,
+	maxPlutusVersion uint,
+	era string,
+) (*plutusCollector, error) {
 	if tx == nil {
 		return nil, errors.New("nil transaction")
 	}
-	used := make(map[common.RedeemerKey]common.ExUnits)
 	witnesses := tx.Witnesses()
 	if witnesses == nil {
-		return used, nil
+		return nil, nil
 	}
 	redeemers := witnesses.Redeemers()
 	if redeemers == nil {
-		return used, nil
+		return nil, nil
 	}
 
 	// Count redeemers to see if we have any scripts to execute
@@ -75,7 +144,7 @@ func evaluatePlutusScripts(
 		redeemerCount++
 	}
 	if redeemerCount == 0 {
-		return used, nil
+		return nil, nil
 	}
 
 	// Resolve all inputs (regular + reference) for building script context
@@ -98,31 +167,10 @@ func evaluatePlutusScripts(
 		resolvedInputsMap[refInput.String()] = refInputsResolved[i]
 	}
 
-	// Build TxInfo lazily based on script version
-	var txInfoV1 TxInfoV1
-	// Cached so each redeemer reuses one PlutusData conversion of the TxInfo.
-	var txInfoV1Cached *CachedTxInfo
-	var txInfoV2 TxInfoV2
-	var txInfoV2Cached *CachedTxInfo
-	var txInfoV3 TxInfoV3
-	var txInfoV3Cached *CachedTxInfo
-	var txInfoV1Built, txInfoV2Built, txInfoV3Built bool
-
-	// Collect all available scripts (witness scripts + reference scripts)
-	availableScripts := AvailablePlutusScripts(tx, resolvedInputs)
-
-	// Get sorted inputs for redeemer index mapping.
-	// The Cardano ledger spec requires spend redeemer indices to
-	// reference positions in the canonically sorted input list.
-	inputs := SortInputs(tx.Inputs())
 	assetMint := tx.AssetMint()
 	if assetMint == nil {
 		assetMint = &common.MultiAsset[common.MultiAssetTypeMint]{}
 	}
-	withdrawals := tx.Withdrawals()
-	votes := tx.VotingProcedures()
-	proposalProcedures := tx.ProposalProcedures()
-	certificates := tx.Certificates()
 
 	// Build witness datums map for datum lookup
 	plutusData := witnesses.PlutusData()
@@ -132,208 +180,259 @@ func evaluatePlutusScripts(
 		witnessDatums[datum.Hash()] = &datum
 	}
 
-	// Execute each redeemer's script
-	for redeemerKey, redeemerValue := range redeemers.Iter() {
-		// Build script purpose for this redeemer
-		purpose, err := BuildScriptPurpose(
-			redeemerKey,
-			resolvedInputsMap,
-			inputs,
-			*assetMint,
-			certificates,
-			withdrawals,
-			votes,
-			proposalProcedures,
-			witnessDatums,
-			protocolMajor,
-		)
-		if err != nil {
-			// Redeemer doesn't match any valid purpose (index out of bounds, etc.)
-			return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-		}
+	return &plutusCollector{
+		tx:                tx,
+		ls:                ls,
+		protocolMajor:     protocolMajor,
+		maxPlutusVersion:  maxPlutusVersion,
+		era:               era,
+		redeemers:         redeemers,
+		resolvedInputs:    resolvedInputs,
+		resolvedInputsMap: resolvedInputsMap,
+		// Collect all available scripts (witness scripts + reference scripts)
+		availableScripts: AvailablePlutusScripts(tx, resolvedInputs),
+		// The Cardano ledger spec requires spend redeemer indices to
+		// reference positions in the canonically sorted input list.
+		sortedInputs:       SortInputs(tx.Inputs()),
+		assetMint:          *assetMint,
+		withdrawals:        tx.Withdrawals(),
+		votes:              tx.VotingProcedures(),
+		proposalProcedures: tx.ProposalProcedures(),
+		certificates:       tx.Certificates(),
+		witnessDatums:      witnessDatums,
+	}, nil
+}
 
-		// Check if the purpose actually requires a script
-		// If not, this redeemer is "extra" (mismatched)
-		switch p := purpose.(type) {
-		case ScriptPurposeSpending:
-			// For spending purposes, verify the input is at a script address
-			if p.Input.Output != nil {
-				addr := p.Input.Output.Address()
-				if (addr.Type() & common.AddressTypeScriptBit) == 0 {
-					// Input is at a key address, not a script address
-					return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-				}
-			}
-		case ScriptPurposeCertifying:
-			// For certifying purposes, check if the certificate has a script credential
-			// ScriptHash() returns empty hash for key credentials
-			if p.ScriptHash() == (common.ScriptHash{}) {
-				return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-			}
-		case ScriptPurposeRewarding:
-			// For rewarding purposes, check if the credential is a script
-			if p.StakeCredential.CredType != common.CredentialTypeScriptHash {
-				return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-			}
-		case ScriptPurposeProposing:
-			// For proposing purposes, check if the proposal has a policy script
-			// If not (empty ScriptHash), this redeemer is "extra"
-			if p.ScriptHash() == (common.ScriptHash{}) {
-				return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-			}
-		case ScriptPurposeVoting:
-			if !VoterUsesScriptCredential(p.Voter) {
-				return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
-			}
-		}
-
-		// Find the script for this purpose
-		scriptHash := purpose.ScriptHash()
-		plutusScript, ok := availableScripts[scriptHash]
-		if !ok {
-			// Missing script should be caught by MissingScriptWitnesses
-			continue
-		}
-
-		// Get datum for V1/V2 scripts (spending purpose only)
-		var datum data.PlutusData
-		var spendInput common.TransactionInput
-		if spendPurpose, ok := purpose.(ScriptPurposeSpending); ok {
-			if spendPurpose.Datum != nil {
-				datum = spendPurpose.Datum
-			}
-			spendInput = spendPurpose.Input.Id
-		}
-
-		units := redeemerValue.ExUnits
-		if budget != nil {
-			units = *budget
-		}
-
-		// Execute based on script version
-		var execErr error
-		var usedUnits common.ExUnits
-		switch s := plutusScript.(type) {
-		case common.PlutusV4Script:
-			return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
-		case common.PlutusV3Script:
-			if maxPlutusVersion < 3 {
-				return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
-			}
-			// Build V3 TxInfo lazily
-			if !txInfoV3Built {
-				if err := ValidatePlutusV3ReferenceInputs(
-					tx,
-					protocolMajor,
-				); err != nil {
-					return nil, common.ScriptContextConstructionError{Err: err}
-				}
-				var err error
-				txInfoV3, err = NewTxInfoV3FromTransaction(
-					ls,
-					tx,
-					resolvedInputs,
-					protocolMajor,
-				)
-				if err != nil {
-					return nil, common.ScriptContextConstructionError{Err: err}
-				}
-				txInfoV3Built = true
-				txInfoV3Cached = NewCachedTxInfo(txInfoV3)
-			}
-			// Build V3 context
-			redeemer := Redeemer{
-				Tag:     redeemerKey.Tag,
-				Index:   redeemerKey.Index,
-				Data:    redeemerValue.Data.Data,
-				ExUnits: redeemerValue.ExUnits,
-			}
-			ctx := NewScriptContextV3(txInfoV3Cached, redeemer, purpose)
-			ctxData := ctx.ToPlutusData()
-			usedUnits, execErr = runPlutusScript(
-				pure, lang.LanguageVersionV3, protocolMajor, costModels[2],
-				s, nil, nil, ctxData, units,
-			)
-		case common.PlutusV2Script:
-			if maxPlutusVersion < 2 {
-				return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
-			}
-			// V2 scripts require a datum for spending purposes
-			if _, isSpend := purpose.(ScriptPurposeSpending); isSpend && datum == nil {
-				return nil, common.MissingDatumForSpendingScriptError{
-					ScriptHash: scriptHash,
-					Input:      spendInput,
-				}
-			}
-			// Build V2 TxInfo lazily
-			if !txInfoV2Built {
-				var err error
-				txInfoV2, err = NewTxInfoV2FromTransaction(
-					ls, tx, resolvedInputs,
-					StrictValidityUpperBoundForTransaction(tx),
-					protocolMajor,
-				)
-				if err != nil {
-					return nil, common.ScriptContextConstructionError{Err: err}
-				}
-				txInfoV2Built = true
-				txInfoV2Cached = NewCachedTxInfo(txInfoV2)
-			}
-			// Build V1V2 context
-			ctx := NewScriptContextV1V2(txInfoV2Cached, purpose)
-			ctxData := ctx.ToPlutusData()
-			usedUnits, execErr = runPlutusScript(
-				pure, lang.LanguageVersionV2, protocolMajor, costModels[1],
-				s, datum, redeemerValue.Data.Data, ctxData, units,
-			)
-		case common.PlutusV1Script:
-			if maxPlutusVersion < 1 {
-				return nil, common.PlutusScriptValidationUnsupportedError{Era: era}
-			}
-			// V1 scripts require a datum for spending purposes
-			if _, isSpend := purpose.(ScriptPurposeSpending); isSpend && datum == nil {
-				return nil, common.MissingDatumForSpendingScriptError{
-					ScriptHash: scriptHash,
-					Input:      spendInput,
-				}
-			}
-			// Build V1 TxInfo lazily
-			if !txInfoV1Built {
-				var err error
-				txInfoV1, err = NewTxInfoV1FromTransaction(
-					ls, tx, resolvedInputs,
-					StrictValidityUpperBoundForTransaction(tx),
-					protocolMajor,
-				)
-				if err != nil {
-					return nil, common.ScriptContextConstructionError{Err: err}
-				}
-				txInfoV1Built = true
-				txInfoV1Cached = NewCachedTxInfo(txInfoV1)
-			}
-			// Build V1V2 context
-			ctx := NewScriptContextV1V2(txInfoV1Cached, purpose)
-			ctxData := ctx.ToPlutusData()
-			usedUnits, execErr = runPlutusScript(
-				pure, lang.LanguageVersionV1, protocolMajor, costModels[0],
-				s, datum, redeemerValue.Data.Data, ctxData, units,
-			)
-		default:
-			continue
-		}
-
-		if execErr != nil {
-			return nil, common.PlutusScriptFailedError{
-				ScriptHash: scriptHash,
-				Tag:        redeemerKey.Tag,
-				Index:      redeemerKey.Index,
-				Err:        execErr,
-			}
-		}
-		used[redeemerKey] = usedUnits
+// collect resolves one redeemer to the script it runs and the arguments the
+// script is applied to. It returns a nil script and no error for a redeemer
+// whose script is not available, which the missing-script-witness rule
+// reports.
+func (c *plutusCollector) collect(
+	redeemerKey common.RedeemerKey,
+	redeemerValue common.RedeemerValue,
+) (*CollectedScript, error) {
+	// Build script purpose for this redeemer
+	purpose, err := BuildScriptPurpose(
+		redeemerKey,
+		c.resolvedInputsMap,
+		c.sortedInputs,
+		c.assetMint,
+		c.certificates,
+		c.withdrawals,
+		c.votes,
+		c.proposalProcedures,
+		c.witnessDatums,
+		c.protocolMajor,
+	)
+	if err != nil {
+		// Redeemer doesn't match any valid purpose (index out of bounds, etc.)
+		return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
 	}
 
-	return used, nil
+	// Check if the purpose actually requires a script
+	// If not, this redeemer is "extra" (mismatched)
+	switch p := purpose.(type) {
+	case ScriptPurposeSpending:
+		// For spending purposes, verify the input is at a script address
+		if p.Input.Output != nil {
+			addr := p.Input.Output.Address()
+			if (addr.Type() & common.AddressTypeScriptBit) == 0 {
+				// Input is at a key address, not a script address
+				return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
+			}
+		}
+	case ScriptPurposeCertifying:
+		// For certifying purposes, check if the certificate has a script
+		// credential. ScriptHash() returns an empty hash for key credentials.
+		if p.ScriptHash() == (common.ScriptHash{}) {
+			return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
+		}
+	case ScriptPurposeRewarding:
+		// For rewarding purposes, check if the credential is a script
+		if p.StakeCredential.CredType != common.CredentialTypeScriptHash {
+			return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
+		}
+	case ScriptPurposeProposing:
+		// For proposing purposes, check if the proposal has a policy script
+		// If not (empty ScriptHash), this redeemer is "extra"
+		if p.ScriptHash() == (common.ScriptHash{}) {
+			return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
+		}
+	case ScriptPurposeVoting:
+		if !VoterUsesScriptCredential(p.Voter) {
+			return nil, common.ExtraRedeemerError{RedeemerKey: redeemerKey}
+		}
+	}
+
+	// Find the script for this purpose
+	scriptHash := purpose.ScriptHash()
+	plutusScript, ok := c.availableScripts[scriptHash]
+	if !ok {
+		// Missing script should be caught by MissingScriptWitnesses
+		return nil, nil
+	}
+
+	// Get datum for V1/V2 scripts (spending purpose only)
+	var datum data.PlutusData
+	var spendInput common.TransactionInput
+	if spendPurpose, ok := purpose.(ScriptPurposeSpending); ok {
+		if spendPurpose.Datum != nil {
+			datum = spendPurpose.Datum
+		}
+		spendInput = spendPurpose.Input.Id
+	}
+
+	collected := &CollectedScript{
+		Key:        redeemerKey,
+		Purpose:    purpose,
+		ScriptHash: scriptHash,
+		Script:     plutusScript,
+		ExUnits:    redeemerValue.ExUnits,
+	}
+	switch plutusScript.(type) {
+	case common.PlutusV4Script:
+		return nil, common.PlutusScriptValidationUnsupportedError{Era: c.era}
+	case common.PlutusV3Script:
+		if c.maxPlutusVersion < 3 {
+			return nil, common.PlutusScriptValidationUnsupportedError{
+				Era: c.era,
+			}
+		}
+		// Build V3 TxInfo lazily
+		if c.txInfoV3 == nil {
+			if err := ValidatePlutusV3ReferenceInputs(
+				c.tx,
+				c.protocolMajor,
+			); err != nil {
+				return nil, common.ScriptContextConstructionError{Err: err}
+			}
+			txInfo, err := NewTxInfoV3FromTransaction(
+				c.ls,
+				c.tx,
+				c.resolvedInputs,
+				c.protocolMajor,
+			)
+			if err != nil {
+				return nil, common.ScriptContextConstructionError{Err: err}
+			}
+			c.txInfoV3 = NewCachedTxInfo(txInfo)
+		}
+		// Build V3 context
+		redeemer := Redeemer{
+			Tag:     redeemerKey.Tag,
+			Index:   redeemerKey.Index,
+			Data:    redeemerValue.Data.Data,
+			ExUnits: redeemerValue.ExUnits,
+		}
+		collected.Context = NewScriptContextV3(
+			c.txInfoV3, redeemer, purpose,
+		).ToPlutusData()
+	case common.PlutusV2Script:
+		if c.maxPlutusVersion < 2 {
+			return nil, common.PlutusScriptValidationUnsupportedError{
+				Era: c.era,
+			}
+		}
+		// V2 scripts require a datum for spending purposes
+		if _, isSpend := purpose.(ScriptPurposeSpending); isSpend &&
+			datum == nil {
+			return nil, common.MissingDatumForSpendingScriptError{
+				ScriptHash: scriptHash,
+				Input:      spendInput,
+			}
+		}
+		// Build V2 TxInfo lazily
+		if c.txInfoV2 == nil {
+			txInfo, err := NewTxInfoV2FromTransaction(
+				c.ls, c.tx, c.resolvedInputs,
+				StrictValidityUpperBoundForTransaction(c.tx),
+				c.protocolMajor,
+			)
+			if err != nil {
+				return nil, common.ScriptContextConstructionError{Err: err}
+			}
+			c.txInfoV2 = NewCachedTxInfo(txInfo)
+		}
+		// Build V1V2 context
+		collected.Datum = datum
+		collected.Redeemer = redeemerValue.Data.Data
+		collected.Context = NewScriptContextV1V2(
+			c.txInfoV2, purpose,
+		).ToPlutusData()
+	case common.PlutusV1Script:
+		if c.maxPlutusVersion < 1 {
+			return nil, common.PlutusScriptValidationUnsupportedError{
+				Era: c.era,
+			}
+		}
+		// V1 scripts require a datum for spending purposes
+		if _, isSpend := purpose.(ScriptPurposeSpending); isSpend &&
+			datum == nil {
+			return nil, common.MissingDatumForSpendingScriptError{
+				ScriptHash: scriptHash,
+				Input:      spendInput,
+			}
+		}
+		// Build V1 TxInfo lazily
+		if c.txInfoV1 == nil {
+			txInfo, err := NewTxInfoV1FromTransaction(
+				c.ls, c.tx, c.resolvedInputs,
+				StrictValidityUpperBoundForTransaction(c.tx),
+				c.protocolMajor,
+			)
+			if err != nil {
+				return nil, common.ScriptContextConstructionError{Err: err}
+			}
+			c.txInfoV1 = NewCachedTxInfo(txInfo)
+		}
+		// Build V1V2 context
+		collected.Datum = datum
+		collected.Redeemer = redeemerValue.Data.Data
+		collected.Context = NewScriptContextV1V2(
+			c.txInfoV1, purpose,
+		).ToPlutusData()
+	default:
+		return nil, nil
+	}
+	return collected, nil
+}
+
+// execute runs the collected script. The budget, when set, replaces the
+// units the redeemer declares. A failed run is a PlutusScriptFailedError
+// naming the redeemer.
+func (s CollectedScript) execute(
+	pure bool,
+	protocolMajor uint,
+	costModels map[uint][]int64,
+	budget *common.ExUnits,
+) (common.ExUnits, error) {
+	units := s.ExUnits
+	if budget != nil {
+		units = *budget
+	}
+	var language lang.LanguageVersion
+	var costModelIndex uint
+	switch s.Script.(type) {
+	case common.PlutusV3Script:
+		language, costModelIndex = lang.LanguageVersionV3, 2
+	case common.PlutusV2Script:
+		language, costModelIndex = lang.LanguageVersionV2, 1
+	default:
+		language, costModelIndex = lang.LanguageVersionV1, 0
+	}
+	usedUnits, err := runPlutusScript(
+		pure, language, protocolMajor, costModels[costModelIndex],
+		s.Script, s.Datum, s.Redeemer, s.Context, units,
+	)
+	if err != nil {
+		return common.ExUnits{}, common.PlutusScriptFailedError{
+			ScriptHash: s.ScriptHash,
+			Tag:        s.Key.Tag,
+			Index:      s.Key.Index,
+			Err:        err,
+		}
+	}
+	return usedUnits, nil
 }
 
 // runPlutusScript evaluates one script. When pure is false it uses a pooled
