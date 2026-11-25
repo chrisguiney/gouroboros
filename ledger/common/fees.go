@@ -30,41 +30,50 @@ func CalculateExecutionUnitsFee(
 		[]TransactionWitnessSet{tx.Witnesses()},
 		SubTransactionWitnessSetsFromTransaction(tx)...,
 	)
-	total := new(big.Rat)
-	pricesValidated := false
+	var units []ExUnits
 	for _, witnesses := range witnessSets {
 		if witnesses == nil || witnesses.Redeemers() == nil {
 			continue
 		}
 		for _, redeemer := range witnesses.Redeemers().Iter() {
-			if !pricesValidated {
-				if prices.MemPrice == nil || prices.MemPrice.Rat == nil {
-					return 0, errors.New("invalid execution memory price")
-				}
-				if prices.StepPrice == nil || prices.StepPrice.Rat == nil {
-					return 0, errors.New("invalid execution step price")
-				}
-				if prices.MemPrice.Sign() < 0 || prices.StepPrice.Sign() < 0 {
-					return 0, errors.New(
-						"execution prices must not be negative",
-					)
-				}
-				pricesValidated = true
-			}
-			if redeemer.ExUnits.Memory < 0 || redeemer.ExUnits.Steps < 0 {
-				return 0, errors.New("execution units must not be negative")
-			}
-			memoryFee := new(big.Rat).Mul(
-				new(big.Rat).SetInt64(redeemer.ExUnits.Memory),
-				prices.MemPrice.Rat,
-			)
-			stepsFee := new(big.Rat).Mul(
-				new(big.Rat).SetInt64(redeemer.ExUnits.Steps),
-				prices.StepPrice.Rat,
-			)
-			total.Add(total, memoryFee)
-			total.Add(total, stepsFee)
+			units = append(units, redeemer.ExUnits)
 		}
+	}
+	return ExecutionUnitsFee(prices, units)
+}
+
+// ExecutionUnitsFee prices a list of execution-unit budgets. The rational
+// total across all entries is rounded up once, as txscriptfee does over the
+// summed ExUnits. With no entries the fee is zero and the prices are not
+// examined.
+func ExecutionUnitsFee(prices ExUnitPrice, units []ExUnits) (uint64, error) {
+	if len(units) == 0 {
+		return 0, nil
+	}
+	if prices.MemPrice == nil || prices.MemPrice.Rat == nil {
+		return 0, errors.New("invalid execution memory price")
+	}
+	if prices.StepPrice == nil || prices.StepPrice.Rat == nil {
+		return 0, errors.New("invalid execution step price")
+	}
+	if prices.MemPrice.Sign() < 0 || prices.StepPrice.Sign() < 0 {
+		return 0, errors.New("execution prices must not be negative")
+	}
+	total := new(big.Rat)
+	for _, u := range units {
+		if u.Memory < 0 || u.Steps < 0 {
+			return 0, errors.New("execution units must not be negative")
+		}
+		memoryFee := new(big.Rat).Mul(
+			new(big.Rat).SetInt64(u.Memory),
+			prices.MemPrice.Rat,
+		)
+		stepsFee := new(big.Rat).Mul(
+			new(big.Rat).SetInt64(u.Steps),
+			prices.StepPrice.Rat,
+		)
+		total.Add(total, memoryFee)
+		total.Add(total, stepsFee)
 	}
 	fee := new(big.Int).Quo(total.Num(), total.Denom())
 	if new(big.Int).Mod(total.Num(), total.Denom()).Sign() != 0 {
