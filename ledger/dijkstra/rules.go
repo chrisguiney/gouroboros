@@ -4442,24 +4442,15 @@ func validateDijkstraScriptDataHash(
 		}
 	}
 
-	langViewsCbor, err := common.EncodeLangViews(
+	computedHash, err := common.ScriptDataHash(
+		redeemersCbor,
+		datumsCbor,
 		usedVersions,
 		pp.CostModels,
 	)
 	if err != nil {
 		return err
 	}
-
-	hashInput := make(
-		[]byte,
-		0,
-		len(redeemersCbor)+len(datumsCbor)+len(langViewsCbor),
-	)
-	hashInput = append(hashInput, redeemersCbor...)
-	hashInput = append(hashInput, datumsCbor...)
-	hashInput = append(hashInput, langViewsCbor...)
-
-	computedHash := common.Blake2b256Hash(hashInput)
 	if *declaredHash != computedHash {
 		return common.ScriptDataHashMismatchError{
 			Declared: *declaredHash,

@@ -79,3 +79,42 @@ func TestExecutionUnitsFeeRejectsInvalidInput(t *testing.T) {
 	_, err = common.ExecutionUnitsFee(exUnitPrices(1, 2, 1, 2), []common.ExUnits{{Memory: -1}})
 	require.Error(t, err)
 }
+
+// Expected hashes are blake2b-256 over the concatenation, computed
+// independently of this package.
+func TestScriptDataHash(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		redeemers, datums []byte
+		versions          map[uint]struct{}
+		costModels        map[uint][]int64
+		want              string
+	}{
+		"empty map redeemers, plutus v3": {
+			redeemers:  []byte{0xa0},
+			versions:   map[uint]struct{}{2: {}},
+			costModels: map[uint][]int64{2: {1, 2, 3}},
+			want:       "a7fc912922b1280821cd2b1da8a40dc2773d39550d056490685a2d6b6e2a7cf9",
+		},
+		"plutus v1 with datums": {
+			redeemers:  []byte{0x81, 0x00},
+			datums:     []byte{0x81, 0x01},
+			versions:   map[uint]struct{}{0: {}},
+			costModels: map[uint][]int64{0: {1, 2}},
+			want:       "f2a38cdd360e6d9afc13b72ca2f49df58b7e153a0d4c1d9521de4d1e8f1e2fe9",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got, err := common.ScriptDataHash(tc.redeemers, tc.datums, tc.versions, tc.costModels)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got.String())
+		})
+	}
+}
+
+func TestScriptDataHashMissingCostModel(t *testing.T) {
+	t.Parallel()
+	_, err := common.ScriptDataHash([]byte{0xa0}, nil, map[uint]struct{}{1: {}}, nil)
+	require.Error(t, err)
+}

@@ -84,3 +84,29 @@ func ExecutionUnitsFee(prices ExUnitPrice, units []ExUnits) (uint64, error) {
 	}
 	return fee.Uint64(), nil
 }
+
+// ScriptDataHash returns the script integrity hash: blake2b-256 over the
+// witness-set redeemers, the witness-set datums (empty when there are none)
+// and the language views for the Plutus versions in use. Redeemers and datums
+// are the bytes as they appear in the witness set. Plutus versions are the
+// zero-based ids used by EncodeLangViews.
+func ScriptDataHash(
+	redeemersCbor []byte,
+	datumsCbor []byte,
+	usedVersions map[uint]struct{},
+	costModels map[uint][]int64,
+) (Blake2b256, error) {
+	langViewsCbor, err := EncodeLangViews(usedVersions, costModels)
+	if err != nil {
+		return Blake2b256{}, err
+	}
+	hashInput := make(
+		[]byte,
+		0,
+		len(redeemersCbor)+len(datumsCbor)+len(langViewsCbor),
+	)
+	hashInput = append(hashInput, redeemersCbor...)
+	hashInput = append(hashInput, datumsCbor...)
+	hashInput = append(hashInput, langViewsCbor...)
+	return Blake2b256Hash(hashInput), nil
+}

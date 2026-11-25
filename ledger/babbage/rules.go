@@ -1482,26 +1482,15 @@ func UtxoValidateScriptDataHash(
 		}
 	}
 
-	// Encode language views per the Cardano spec
-	langViewsCbor, err := common.EncodeLangViews(
+	computedHash, err := common.ScriptDataHash(
+		redeemersCbor,
+		datumsCbor,
 		usedVersions,
 		tmpPparams.CostModels,
 	)
 	if err != nil {
 		return err
 	}
-
-	// Concatenate and hash
-	hashInput := make(
-		[]byte,
-		0,
-		len(redeemersCbor)+len(datumsCbor)+len(langViewsCbor),
-	)
-	hashInput = append(hashInput, redeemersCbor...)
-	hashInput = append(hashInput, datumsCbor...)
-	hashInput = append(hashInput, langViewsCbor...)
-
-	computedHash := common.Blake2b256Hash(hashInput)
 
 	// Compare with declared hash
 	// Note: declaredHash is guaranteed non-nil here due to earlier checks,
